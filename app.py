@@ -1,8 +1,17 @@
+# NOTE: Content too large for inline parameter. File will be updated via alternative method.
+
 """
 Flight Fare Comparison — Main Streamlit Application
 
 A production-ready Streamlit web application that compares flight fares
-across multiple Point-of-Sale (POS) countries to find the cheapest tickets.
+across multiple Point-of-Sale (POS) countries using multiple flight data providers.
+
+Supported providers:
+    - Duffel (recommended) — free test mode, 300+ airlines
+    - Amadeus (legacy) — decommissioning July 17, 2026
+    - FlightAPI.io — budget-friendly
+    - Travelpayouts — free affiliate data
+    - Mock/Demo — synthetic data, no API key
 
 Usage:
     streamlit run app.py
@@ -95,15 +104,10 @@ def sanitize_iata(code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Mock Search Engine — production wiring lives in search_engine.py
+# Mock Search Engine — fallback when no real provider is available
 # ---------------------------------------------------------------------------
 class MockSearchEngine:
-    """Stand-in search engine that returns realistic demo data.
-
-    In production this class is replaced by ``FlightSearchEngine`` from
-    ``search_engine.py``.  The interface is intentionally identical so
-    that ``app.py`` requires zero changes when the real backend is wired in.
-    """
+    """Stand-in search engine that returns realistic demo data."""
 
     def search_multi_pos(
         self,
@@ -155,7 +159,7 @@ class MockSearchEngine:
                     "Original Currency": random.choice(["EUR", "TRY", "INR", "BRL", "PLN", "HUF", "RON", "THB"]),
                     "Duration": duration_str, "Duration (min)": duration_hours * 60 + duration_mins,
                     "Stops": stops, "Departure": dep_time, "Arrival": arr_time,
-                    "Source": "Amadeus",
+                    "Source": "Demo",
                 })
             base_price += random.uniform(-50, 100)
 
@@ -193,6 +197,60 @@ class MockSearchResult:
 
 
 # ---------------------------------------------------------------------------
+# Provider Selector
+# ---------------------------------------------------------------------------
+def _render_provider_selector() -> str:
+    """Render the flight provider selector in the sidebar.
+
+    Returns the selected provider slug.
+    """
+    providers_meta: list[tuple[str, str, str]] = [
+        ("duffel", "Duffel ★", "Recommended — free test mode, 300+ airlines"),
+        ("amadeus", "Amadeus ⚠️", "Legacy — decommissioning July 2026"),
+        ("flightapi", "FlightAPI.io", "Budget-friendly — 20-100 free calls"),
+        ("travelpayouts", "Travelpayouts", "Free — cached/aggregated fares"),
+        ("mock", "Demo Mode 🎮", "No API key — synthetic data"),
+    ]
+
+    cred_status: dict[str, bool] = {
+        "duffel": bool(os.getenv("DUFFEL_API_KEY", "").strip()),
+        "amadeus": bool(os.getenv("AMADEUS_API_KEY", "").strip() and os.getenv("AMADEUS_API_SECRET", "").strip()),
+        "flightapi": bool(os.getenv("FLIGHTAPI_KEY", "").strip()),
+        "travelpayouts": bool(os.getenv("TRAVELPAYOUTS_TOKEN", "").strip()),
+        "mock": True,
+    }
+
+    options = [slug for slug, _, _ in providers_meta]
+    default = os.getenv("FLIGHT_PROVIDER", "duffel").lower()
+    if default not in options:
+        default = "mock"
+
+    format_fn = lambda s: next((f"{label} {'✅' if cred_status.get(s, False) else '❌'}" for slug, label, _ in providers_meta if slug == s), s)
+
+    selected: str = st.selectbox(
+        "🔌 Flight Data Provider",
+        options=options,
+        index=options.index(default) if default in options else 0,
+        format_func=format_fn,
+        help="Select which API to use. ✅ = credentials configured in .env",
+        key="provider_select",
+    )
+
+    desc = next((d for s, _, d in providers_meta if s == selected), "")
+    st.caption(desc)
+
+    if selected == "mock":
+        st.info("🎮 **Demo Mode** — No API key needed. Using realistic synthetic data.")
+    elif selected == "amadeus":
+        st.warning("⚠️ **Amadeus decommissioning July 17, 2026.** Migrate to Duffel.")
+    elif not cred_status.get(selected, False):
+        st.error(f"❌ No credentials for {selected}. Add to `.env` or use Demo Mode.")
+
+    st.divider()
+    return selected
+
+
+# ---------------------------------------------------------------------------
 # Sidebar — Search Form
 # ---------------------------------------------------------------------------
 def render_sidebar() -> dict[str, Any] | None:
@@ -201,6 +259,9 @@ def render_sidebar() -> dict[str, Any] | None:
         st.markdown("<h1 style='margin-bottom:0'>✈️ Flight Fare Finder</h1>", unsafe_allow_html=True)
         st.markdown("<p style='color:gray; margin-top:4px;'>Compare prices across 15 countries to find the cheapest flights</p>", unsafe_allow_html=True)
         st.divider()
+
+        # Provider selection
+        selected_provider = _render_provider_selector()
 
         st.subheader("🛫 Route")
         origin: str = st.text_input("Origin Airport (IATA)", placeholder="e.g., HEL", help="Enter a 3-letter IATA airport code", key="origin_input")
@@ -244,7 +305,7 @@ def render_sidebar() -> dict[str, Any] | None:
         search_clicked: bool = st.button("🔍 Search Flights", type="primary", use_container_width=True, key="search_button")
 
         st.divider()
-        st.markdown("<div style='text-align:center; color:gray; font-size:0.8em;'>Powered by Amadeus Flight API<br>© 2025 Flight Fare Finder</div>", unsafe_allow_html=True)
+        st.markdown("<div style='text-align:center; color:gray; font-size:0.8em;'>Multi-Provider Flight Search<br>Duffel · Amadeus · FlightAPI · Travelpayouts<br>© 2025 Flight Fare Finder</div>", unsafe_allow_html=True)
 
     if not search_clicked:
         return None
@@ -267,6 +328,7 @@ def render_sidebar() -> dict[str, Any] | None:
         st.sidebar.error("Please select at least one country to compare."); return None
 
     return {
+        "provider": selected_provider,
         "origin": sanitize_iata(origin), "destination": sanitize_iata(destination),
         "departure_date": departure_date.isoformat(),
         "return_date": return_date.isoformat() if return_date else None,
@@ -465,7 +527,7 @@ def render_welcome_screen() -> None:
         "**Be flexible with dates** — mid-week flights are often cheaper.",
         "**Compare all countries** — 15-country search gives broadest coverage.",
         "**Check direct flights first** — use the 'Direct Flights Only' filter.",
-        "**Book early** — prices tend to increase closer to departure.",
+        "**Book early** — prices tend to increase closer to departure.
     ]
     for tip in tips:
         st.markdown(f"- {tip}")
@@ -480,18 +542,35 @@ def render_welcome_screen() -> None:
 def execute_search(params: dict[str, Any]) -> "MockSearchResult":
     """Run the flight search with progress tracking.
 
-    Attempts to use the real FlightSearchEngine when credentials are configured;
-    otherwise falls back to MockSearchEngine with demo data.
+    Uses the selected provider from the UI, falling back to demo mode.
     """
+    selected_provider: str = params.get("provider", "mock")
+
     use_real_engine: bool = False
     try:
+        import os
         from search_engine import FlightSearchEngine
         from config import load_config
         from models import SearchQuery
         from proxy_manager import get_country_by_code
+        from providers import get_provider
 
+        os.environ["FLIGHT_PROVIDER"] = selected_provider
         config = load_config()
-        engine = FlightSearchEngine(config)
+
+        provider_kwargs: dict[str, str] = {}
+        if selected_provider == "duffel":
+            provider_kwargs["api_key"] = os.getenv("DUFFEL_API_KEY", "")
+        elif selected_provider == "amadeus":
+            provider_kwargs["api_key"] = os.getenv("AMADEUS_API_KEY", "")
+            provider_kwargs["api_secret"] = os.getenv("AMADEUS_API_SECRET", "")
+        elif selected_provider == "flightapi":
+            provider_kwargs["api_key"] = os.getenv("FLIGHTAPI_KEY", "")
+        elif selected_provider == "travelpayouts":
+            provider_kwargs["token"] = os.getenv("TRAVELPAYOUTS_TOKEN", "")
+
+        provider = get_provider(selected_provider, **provider_kwargs)
+        engine = FlightSearchEngine(config, provider=provider)
         use_real_engine = True
     except Exception:
         engine = MockSearchEngine()
@@ -586,6 +665,16 @@ def main() -> None:
     if search_params is None:
         render_welcome_screen()
         return
+
+    # Show provider badge
+    provider = search_params.get("provider", "mock")
+    provider_labels = {
+        "duffel": ("Duffel ★", "blue"), "amadeus": ("Amadeus ⚠️", "orange"),
+        "flightapi": ("FlightAPI.io", "green"), "travelpayouts": ("Travelpayouts", "violet"),
+        "mock": ("Demo Mode 🎮", "gray"),
+    }
+    label, color = provider_labels.get(provider, (provider, "gray"))
+    st.markdown(f"<div style='text-align:right;'><span style='background:{color}; color:white; padding:4px 12px; border-radius:12px; font-size:0.8em;'>{label}</span></div>", unsafe_allow_html=True)
 
     with st.spinner("Searching for flights across multiple countries..."):
         try:
