@@ -1,8 +1,7 @@
-"""Multi-POS flight search orchestration and result aggregation.
+"""Multi-POS flight search orchestration using provider-agnostic architecture.
 
-This module implements the core search engine that queries the Amadeus
-API across multiple Point-of-Sale countries, converts all prices to EUR,
-and aggregates the results into a unified, sorted response.
+Queries any configured flight provider across multiple Point-of-Sale countries,
+converts all prices to EUR, and aggregates results.
 
 Example::
 
@@ -11,11 +10,7 @@ Example::
 
     config = load_config()
     engine = FlightSearchEngine(config)
-    result = engine.search_multi_pos(
-        SearchQuery(origin="HEL", destination="LHR", departure_date="2025-07-15")
-    )
-    for offer in result.offers[:5]:
-        print(f"{offer.price_eur:.2f} EUR  {offer.airline_name}")
+    result = engine.search_multi_pos(query=SearchQuery(...))
 """
 
 from __future__ import annotations
@@ -25,283 +20,193 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from api_client import AmadeusClient, APIError, TimeoutError
-from config import AppConfig
+from config import AppConfig, get_provider_config
 from currency import convert_to_eur
 from models import FlightOffer, FlightSegment, SearchQuery, SearchResult
 from proxy_manager import CountryConfig, get_enabled_countries
+from providers import FlightProvider, ProviderError, get_provider
 from utils import format_duration, generate_search_id
 
 logger = logging.getLogger(__name__)
 
 
 class FlightSearchEngine:
-    """Orchestrate multi-POS flight searches and aggregate results.
+    """Orchestrate multi-POS flight searches with any provider.
 
     Parameters
     ----------
-    config:
-        Application configuration (API keys, timeouts, etc.).
+    config: Application configuration.
+    provider: Optional pre-configured provider instance.
     """
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, provider: FlightProvider | None = None) -> None:
         self._config = config
-        self._client = AmadeusClient(
-            api_key=config.amadeus_key,
-            api_secret=config.amadeus_secret,
-            test_mode=config.debug,
-        )
-        logger.debug(
-            "FlightSearchEngine initialised (timeout=%ds, debug=%s)",
-            config.api_timeout,
-            config.debug,
-        )
+
+        if provider is not None:
+            self._provider = provider
+        elif config.has_any_credentials or config.provider != "mock":
+            try:
+                kwargs = get_provider_config(config)
+                self._provider = get_provider(config.provider, **kwargs)
+            except Exception as exc:
+                logger.warning("Failed to initialize %s provider: %s. Using demo mode.", config.provider, exc)
+                self._provider = get_provider("mock")
+        else:
+            logger.info("No credentials configured — using demo mode")
+            self._provider = get_provider("mock")
+
+        logger.debug("Search engine using provider: %s", self._provider.info.slug)
+
+    @property
+    def provider_info(self) -> dict[str, Any]:
+        """Return info about the active provider."""
+        info = self._provider.info
+        return {
+            "name": info.name, "slug": info.slug,
+            "description": info.description, "status": info.status,
+            "requires_api_key": info.requires_api_key,
+            "supports_pos_comparison": info.supports_pos_comparison,
+        }
 
     def search_multi_pos(
-        self,
-        query: SearchQuery,
+        self, query: SearchQuery,
         countries: list[CountryConfig] | None = None,
         progress_callback: Callable | None = None,
     ) -> SearchResult:
-        """Search flights across multiple POS countries.
-
-        For each enabled country the engine:
-
-        1. Calls Amadeus with the country's local currency.
-        2. Parses raw offers into :class:`FlightOffer` objects.
-        3. Converts prices to EUR.
-        4. Aggregates all offers and sorts by ``price_eur`` ascending.
-
-        If a single-country search fails the error is logged and the
-        engine continues with the remaining countries.
-
-        Parameters
-        ----------
-        query:
-            Validated search parameters.
-        countries:
-            Explicit list of countries to search.  When *None* all
-            enabled countries from the proxy manager are used.
-        progress_callback:
-            Optional callable invoked after each country search completes.
-
-        Returns
-        -------
-        SearchResult
-            Aggregated, sorted search results with price statistics.
-        """
-        start_time = time.perf_counter()
-
+        """Search flights across multiple POS countries."""
+        start = time.perf_counter()
         if countries is None:
             countries = get_enabled_countries()
 
-        total_countries = len(countries)
-        logger.info(
-            "Starting multi-POS search: %s -> %s on %s across %d countries",
-            query.origin, query.destination, query.departure_date, total_countries,
-        )
+        if not self._provider.info.supports_pos_comparison:
+            logger.info("Provider %s doesn't support multi-POS; running single search", self._provider.info.slug)
+            try:
+                result = self._search_single(query)
+            except Exception as exc:
+                logger.error("Provider search failed: %s", exc)
+                self._provider = get_provider("mock")
+                result = self._search_single(query)
+            if progress_callback:
+                progress_callback(1, 1, self._provider.info.name)
+            return result
+
+        total = len(countries)
+        logger.info("Multi-POS search: %s → %s across %d countries via %s", query.origin, query.destination, total, self._provider.info.slug)
 
         all_offers: list[FlightOffer] = []
-        countries_searched = 0
-
-        for idx, country in enumerate(countries, start=1):
-            logger.info(
-                "[%d/%d] Searching POS: %s (%s, currency=%s)",
-                idx, total_countries, country.name, country.code, country.currency,
-            )
-
+        searched = 0
+        for i, country in enumerate(countries, 1):
+            logger.info("[%d/%d] Searching %s (%s)", i, total, country.name, country.currency)
             try:
-                country_offers = self._search_single_pos(query, country)
+                country_offers = self._search_single(query, country)
                 all_offers.extend(country_offers)
-                countries_searched += 1
-                logger.info("[%d/%d] %s returned %d offers", idx, total_countries, country.name, len(country_offers))
-            except APIError as exc:
-                logger.error("[%d/%d] Search failed for %s: %s", idx, total_countries, country.name, exc)
-            except Exception as exc:
-                logger.exception("[%d/%d] Unexpected error for %s: %s", idx, total_countries, country.name, exc)
-
-            if progress_callback is not None:
+                searched += 1
+            except ProviderError as exc:
+                logger.error("[%d/%d] %s failed: %s", i, total, country.name, exc)
+            except Exception:
+                logger.exception("[%d/%d] Unexpected error for %s", i, total, country.name)
+            if progress_callback:
                 try:
-                    progress_callback(idx, total_countries, country.name)
+                    progress_callback(i, total, country.name)
                 except Exception:
-                    logger.debug("Progress callback raised an exception", exc_info=True)
+                    pass
 
-        duration = time.perf_counter() - start_time
-        logger.info(
-            "Multi-POS search complete: %d offers from %d/%d countries in %.2fs",
-            len(all_offers), countries_searched, total_countries, duration,
-        )
+        duration = time.perf_counter() - start
+        return self._aggregate(all_offers, query, duration, searched)
 
-        return self._aggregate_results(
-            all_offers=all_offers, query=query, duration=duration,
-            countries_searched=countries_searched,
-        )
-
-    def _search_single_pos(
-        self,
-        query: SearchQuery,
-        country: CountryConfig,
-    ) -> list[FlightOffer]:
-        """Execute a flight search for a single POS country."""
-        logger.debug("Searching single POS: country=%s, currency=%s", country.name, country.currency)
-
-        raw_offers = self._client.search_flights(
-            origin=query.origin,
-            destination=query.destination,
-            departure_date=query.departure_date,
-            return_date=query.return_date,
-            adults=query.adults,
-            children=query.children,
-            cabin_class=query.cabin_class,
-            currency=country.currency,
-            pos_code=country.pos_code,
+    def _search_single(self, query: SearchQuery, country: CountryConfig | None = None) -> list[FlightOffer]:
+        """Execute a single search, optionally with a specific POS country."""
+        currency = country.currency if country else self._config.default_currency
+        pos_label = country.name if country else "default"
+        result = self._provider.search_flights(
+            origin=query.origin, destination=query.destination,
+            departure_date=query.departure_date, return_date=query.return_date,
+            adults=query.adults, children=query.children,
+            cabin_class=query.cabin_class, currency=currency,
             max_results=query.max_results,
         )
-
-        offers: list[FlightOffer] = []
-        for raw in raw_offers:
-            parsed = self._parse_amadeus_offer(raw, country)
-            if parsed is not None:
+        offers = []
+        for raw_offer in result.offers:
+            parsed = self._normalize_offer(raw_offer, currency, pos_label, country.code if country else "")
+            if parsed:
                 offers.append(parsed)
-
-        logger.debug("Parsed %d/%d valid offers for %s", len(offers), len(raw_offers), country.name)
         return offers
 
-    def _parse_amadeus_offer(
-        self,
-        raw_offer: dict[str, Any],
-        country: CountryConfig,
-    ) -> FlightOffer | None:
-        """Convert a raw Amadeus offer dictionary into a :class:`FlightOffer`."""
+    def _normalize_offer(self, raw: Any, local_currency: str, pos_country: str, pos_code: str) -> FlightOffer | None:
+        """Normalize a provider-specific offer to the unified FlightOffer model."""
         try:
-            offer_id = raw_offer.get("id", "unknown")
+            from providers.base import FlightOffer as POffer, FlightSegment as PSegment
 
-            price_data = raw_offer.get("price", {})
-            original_price_str = price_data.get("total", "0")
-            original_currency = price_data.get("currency", country.currency)
-            original_price = float(original_price_str)
-            price_eur = convert_to_eur(original_price, original_currency)
+            if isinstance(raw, FlightOffer):
+                return raw
 
-            itineraries = raw_offer.get("itineraries", [])
-            segments: list[FlightSegment] = []
-            total_stops = 0
-            total_duration_iso = ""
+            if isinstance(raw, POffer):
+                segments = []
+                for seg in raw.segments:
+                    if isinstance(seg, FlightSegment):
+                        segments.append(seg)
+                    elif isinstance(seg, PSegment):
+                        segments.append(FlightSegment(
+                            departure_airport=seg.departure_airport,
+                            departure_time=seg.departure_time,
+                            arrival_airport=seg.arrival_airport,
+                            arrival_time=seg.arrival_time,
+                            airline=seg.airline,
+                            airline_name=seg.airline_name,
+                            flight_number=seg.flight_number,
+                            duration=seg.duration,
+                            aircraft=seg.aircraft,
+                        ))
+                price_eur = convert_to_eur(raw.price, local_currency) if raw.currency != "EUR" else raw.price
+                return FlightOffer(
+                    id=raw.id, price_eur=price_eur, price_original=raw.price,
+                    original_currency=raw.currency, airline=raw.airline,
+                    airline_name=raw.airline_name, segments=segments,
+                    total_duration=raw.total_duration, stops=raw.stops,
+                    cabin_class=raw.cabin_class, pos_country=pos_country,
+                    pos_code=pos_code, source=raw.source,
+                    last_ticketing_date=raw.last_ticketing_date,
+                    bookable_seats=raw.bookable_seats,
+                )
 
-            for itinerary in itineraries:
-                total_duration_iso = itinerary.get("duration", "")
-                raw_segments = itinerary.get("segments", [])
-
-                for seg in raw_segments:
-                    departure = seg.get("departure", {})
-                    arrival = seg.get("arrival", {})
-                    carrier = seg.get("carrierCode", "")
-                    seg_duration_iso = seg.get("duration", "")
-
-                    segment = FlightSegment(
-                        departure_airport=departure.get("iataCode", ""),
-                        departure_time=departure.get("at", ""),
-                        arrival_airport=arrival.get("iataCode", ""),
-                        arrival_time=arrival.get("at", ""),
-                        airline=carrier,
-                        airline_name=self._resolve_airline_name(carrier),
-                        flight_number=f"{carrier}{seg.get('number', '')}",
-                        duration=format_duration(seg_duration_iso),
-                        aircraft=seg.get("aircraft", {}).get("code"),
-                    )
-                    segments.append(segment)
-
-                if len(raw_segments) > 1:
-                    total_stops += len(raw_segments) - 1
-
-            if len(itineraries) > 1:
-                total_stops = sum(max(0, len(itin.get("segments", [])) - 1) for itin in itineraries)
-
-            validating_airlines = raw_offer.get("validatingAirlineCodes", [])
-            primary_airline = validating_airlines[0] if validating_airlines else ""
-            if not primary_airline and segments:
-                primary_airline = segments[0].airline
-
-            total_duration_human = format_duration(total_duration_iso)
-            if not total_duration_human and segments:
-                durations = [format_duration(itin.get("duration", "")) for itin in itineraries]
-                total_duration_human = " / ".join(d for d in durations if d)
-
-            traveler_pricings = raw_offer.get("travelerPricings", [{}])
-            fare_details = traveler_pricings[0].get("fareDetailsBySegment", [{}]) if traveler_pricings else [{}]
-            cabin = fare_details[0].get("cabin", "ECONOMY") if fare_details else "ECONOMY"
-
-            return FlightOffer(
-                id=offer_id,
-                price_eur=price_eur,
-                price_original=original_price,
-                original_currency=original_currency,
-                airline=primary_airline,
-                airline_name=self._resolve_airline_name(primary_airline),
-                segments=segments,
-                total_duration=total_duration_human,
-                stops=total_stops,
-                cabin_class=cabin,
-                pos_country=country.name,
-                pos_code=country.code,
-                source="amadeus",
-                last_ticketing_date=raw_offer.get("lastTicketingDate"),
-                bookable_seats=raw_offer.get("numberOfBookableSeats"),
-            )
-
+            if isinstance(raw, dict):
+                price = float(raw.get("price", 0))
+                curr = raw.get("currency", local_currency)
+                price_eur = convert_to_eur(price, curr) if curr != "EUR" else price
+                return FlightOffer(
+                    id=raw.get("id", ""), price_eur=price_eur,
+                    price_original=price, original_currency=curr,
+                    airline=raw.get("airline", ""),
+                    airline_name=raw.get("airline_name", raw.get("airline", "")),
+                    segments=[], total_duration=raw.get("duration", ""),
+                    stops=raw.get("stops", 0),
+                    cabin_class=raw.get("cabin_class", "ECONOMY"),
+                    pos_country=pos_country, pos_code=pos_code,
+                    source=raw.get("source", "unknown"),
+                )
+            return None
         except Exception as exc:
-            offer_id = raw_offer.get("id", "unknown") if isinstance(raw_offer, dict) else "unknown"
-            logger.warning("Failed to parse offer %s for %s: %s", offer_id, country.name, exc)
+            logger.warning("Failed to normalize offer: %s", exc)
             return None
 
-    def _aggregate_results(
-        self,
-        all_offers: list[FlightOffer],
-        query: SearchQuery,
-        duration: float,
-        countries_searched: int,
-    ) -> SearchResult:
-        """Aggregate offers, compute price statistics, and build a :class:`SearchResult`."""
-        if not all_offers:
+    def _aggregate(self, offers: list[FlightOffer], query: SearchQuery, duration: float, searched: int) -> SearchResult:
+        """Aggregate and sort offers, compute statistics."""
+        if not offers:
             return SearchResult(
                 search_id=generate_search_id(), query=query, offers=[],
-                countries_searched=countries_searched, total_offers=0,
+                countries_searched=searched, total_offers=0,
                 cheapest_price=0.0, average_price=0.0, most_expensive_price=0.0,
                 search_duration_seconds=round(duration, 2),
                 generated_at=datetime.now(timezone.utc).isoformat(),
             )
-
-        sorted_offers = sorted(all_offers, key=lambda o: o.price_eur)
+        sorted_offers = sorted(offers, key=lambda o: o.price_eur)
         prices = [o.price_eur for o in sorted_offers]
-        cheapest = prices[0]
-        most_expensive = prices[-1]
-        average = round(sum(prices) / len(prices), 2)
-
         return SearchResult(
             search_id=generate_search_id(), query=query, offers=sorted_offers,
-            countries_searched=countries_searched, total_offers=len(sorted_offers),
-            cheapest_price=cheapest, average_price=average,
-            most_expensive_price=most_expensive,
+            countries_searched=searched, total_offers=len(sorted_offers),
+            cheapest_price=prices[0],
+            average_price=round(sum(prices) / len(prices), 2),
+            most_expensive_price=prices[-1],
             search_duration_seconds=round(duration, 2),
             generated_at=datetime.now(timezone.utc).isoformat(),
         )
-
-    @staticmethod
-    def _resolve_airline_name(carrier_code: str) -> str:
-        """Resolve a carrier code to a human-readable airline name."""
-        AIRLINE_NAMES: dict[str, str] = {
-            "AY": "Finnair", "BA": "British Airways", "AF": "Air France",
-            "LH": "Lufthansa", "KL": "KLM", "TK": "Turkish Airlines",
-            "EK": "Emirates", "QR": "Qatar Airways", "AA": "American Airlines",
-            "DL": "Delta Air Lines", "UA": "United Airlines", "VS": "Virgin Atlantic",
-            "EI": "Aer Lingus", "IB": "Iberia", "TP": "TAP Air Portugal",
-            "AZ": "ITA Airways", "OS": "Austrian Airlines", "SK": "SAS",
-            "DY": "Norwegian", "FR": "Ryanair", "U2": "easyJet",
-            "LX": "SWISS", "SN": "Brussels Airlines", "LO": "LOT Polish Airlines",
-            "RO": "TAROM", "A3": "Aegean Airlines", "PC": "Pegasus Airlines",
-            "6E": "IndiGo", "AI": "Air India", "EY": "Etihad Airways",
-            "SQ": "Singapore Airlines", "CX": "Cathay Pacific", "QF": "Qantas",
-            "NH": "ANA", "JL": "Japan Airlines", "KE": "Korean Air",
-            "OZ": "Asiana Airlines", "HU": "Hainan Airlines", "CA": "Air China",
-            "CZ": "China Southern", "MU": "China Eastern",
-        }
-        return AIRLINE_NAMES.get(carrier_code, carrier_code)
